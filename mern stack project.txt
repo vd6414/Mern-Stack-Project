@@ -1,0 +1,181 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const axios = require('axios');
+const app = express();
+
+// Connect to MongoDB
+mongoose.connect('mongodb://localhost:27017/productTransactionsDB', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+}).then(() => {
+    console.log('Connected to MongoDB');
+}).catch((err) => {
+    console.error('Error connecting to MongoDB:', err);
+});
+
+// Define Product Transaction Schema and Model
+const productTransactionSchema = new mongoose.Schema({
+    title: String,
+    description: String,
+    price: Number,
+    category: String,
+    sold: Boolean,
+    dateOfSale: Date
+});
+
+const ProductTransaction = mongoose.model('ProductTransaction', productTransactionSchema);
+
+// API to fetch data from third-party API and initialize the database
+app.get('/api/init', async (req, res) => {
+    try {
+        const response = await axios.get('https://s3.amazonaws.com/roxiler.com/product_transaction.json');
+        const productTransactions = response.data;
+
+        // Clear the collection first if you want to avoid duplication
+        await ProductTransaction.deleteMany({});
+        await ProductTransaction.insertMany(productTransactions);
+
+        res.status(200).send('Database initialized with seed data');
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).send('Error fetching data or initializing the database');
+    }
+});
+
+// API to list all transactions with search and pagination
+app.get('/api/transactions', async (req, res) => {
+    const { month, page = 1, perPage = 10, search = '' } = req.query;
+
+    const monthNumber = new Date(`${month} 1`).getMonth();
+    const filter = {
+        dateOfSale: { $gte: new Date(2023, monthNumber), $lte: new Date(2023, monthNumber + 1) },
+        $or: [
+            { title: { $regex: search, $options: 'i' } },
+            { description: { $regex: search, $options: 'i' } },
+            { price: { $regex: search, $options: 'i' } }
+        ]
+    };
+
+    try {
+        const transactions = await ProductTransaction.find(filter)
+            .skip((page - 1) * perPage)
+            .limit(Number(perPage));
+        const count = await ProductTransaction.countDocuments(filter);
+
+        res.json({ transactions, totalPages: Math.ceil(count / perPage) });
+    } catch (error) {
+        res.status(500).send('Error fetching transactions');
+    }
+});
+
+// API to get statistics (total sale amount, total sold items, total unsold items)
+app.get('/api/statistics', async (req, res) => {
+    const { month } = req.query;
+
+    const monthNumber = new Date(`${month} 1`).getMonth();
+
+    try {
+        const totalSaleAmount = await ProductTransaction.aggregate([
+            { $match: { dateOfSale: { $gte: new Date(2023, monthNumber), $lte: new Date(2023, monthNumber + 1) } } },
+            { $group: { _id: null, total: { $sum: "$price" } } }
+        ]);
+
+        const totalSoldItems = await ProductTransaction.countDocuments({
+            sold: true,
+            dateOfSale: { $gte: new Date(2023, monthNumber), $lte: new Date(2023, monthNumber + 1) }
+        });
+
+        const totalUnsoldItems = await ProductTransaction.countDocuments({
+            sold: false,
+            dateOfSale: { $gte: new Date(2023, monthNumber), $lte: new Date(2023, monthNumber + 1) }
+        });
+
+        res.json({
+            totalSaleAmount: totalSaleAmount[0]?.total || 0,
+            totalSoldItems,
+            totalUnsoldItems
+        });
+    } catch (error) {
+        res.status(500).send('Error fetching statistics');
+    }
+});
+
+// API for bar chart (price range distribution)
+app.get('/api/barchart', async (req, res) => {
+    const { month } = req.query;
+
+    const monthNumber = new Date(`${month} 1`).getMonth();
+    const priceRanges = [
+        { label: '0-100', min: 0, max: 100 },
+        { label: '101-200', min: 101, max: 200 },
+        { label: '201-300', min: 201, max: 300 },
+        { label: '301-400', min: 301, max: 400 },
+        { label: '401-500', min: 401, max: 500 },
+        { label: '501-600', min: 501, max: 600 },
+        { label: '601-700', min: 601, max: 700 },
+        { label: '701-800', min: 701, max: 800 },
+        { label: '801-900', min: 801, max: 900 },
+        { label: '901-above', min: 901, max: Infinity }
+    ];
+
+    try {
+        const results = await Promise.all(priceRanges.map(async (range) => {
+            const count = await ProductTransaction.countDocuments({
+                price: { $gte: range.min, $lte: range.max },
+                dateOfSale: { $gte: new Date(2023, monthNumber), $lte: new Date(2023, monthNumber + 1) }
+            });
+            return { range: range.label, count };
+        }));
+
+        res.json(results);
+    } catch (error) {
+        res.status(500).send('Error fetching bar chart data');
+    }
+});
+
+// API for pie chart (category distribution)
+app.get('/api/piechart', async (req, res) => {
+    const { month } = req.query;
+
+    const monthNumber = new Date(`${month} 1`).getMonth();
+
+    try {
+        const categories = await ProductTransaction.aggregate([
+            { $match: { dateOfSale: { $gte: new Date(2023, monthNumber), $lte: new Date(2023, monthNumber + 1) } } },
+            { $group: { _id: '$category', count: { $sum: 1 } } }
+        ]);
+
+        res.json(categories);
+    } catch (error) {
+        res.status(500).send('Error fetching pie chart data');
+    }
+});
+
+// API to combine the responses of the previous three APIs
+app.get('/api/combined', async (req, res) => {
+    const { month } = req.query;
+
+    try {
+        const [transactions, statistics, barChart, pieChart] = await Promise.all([
+            axios.get(`http://localhost:3000/api/transactions?month=${month}`),
+            axios.get(`http://localhost:3000/api/statistics?month=${month}`),
+            axios.get(`http://localhost:3000/api/barchart?month=${month}`),
+            axios.get(`http://localhost:3000/api/piechart?month=${month}`)
+        ]);
+
+        res.json({
+            transactions: transactions.data,
+            statistics: statistics.data,
+            barChart: barChart.data,
+            pieChart: pieChart.data
+        });
+    } catch (error) {
+        res.status(500).send('Error fetching combined data');
+    }
+});
+
+// Start the server
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
